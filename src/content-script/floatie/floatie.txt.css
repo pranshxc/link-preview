@@ -1,7 +1,10 @@
 /* Floatie CSS */
 #sp-floatie-container {
   display: none;
-  position: absolute;
+  /* Use fixed positioning so coordinates are viewport-relative.
+     Previously 'absolute' had no positioned ancestor inside the shadow DOM,
+     causing the floatie to render off-screen on modern sites like x.com. */
+  position: fixed;
   top: 0;
   left: 0;
   background: #222222;
@@ -10,6 +13,9 @@
   padding: 2px;
   font-size: 11px;
   font-family: sans-serif;
+  /* Guarantee floatie is always on top. The JS z-index logic will override
+     this, but this is a safe fallback so it's never invisible on first paint. */
+  z-index: 2147483647;
 }
 
 #sp-floatie-arrow {
@@ -35,6 +41,7 @@
   padding-left: 8px;
   padding-right: 8px;
   margin: 0 0 !important;
+  cursor: pointer;
 }
 
 .hide-1 {

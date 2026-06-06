@@ -35,9 +35,6 @@ export class Floatie {
             <div id="sp-floatie-copy" class="sp-floatie-action" data-action="copy">Copy</div>
         </div>
         `;
-    // Parse markup into a temporary container so we can query IDs reliably
-    // before any DOM insertion. Previously used DocumentFragment + createRange
-    // which had issues querying elements before attachment.
     const tmp = document.createElement("div");
     tmp.innerHTML = markup;
 
@@ -70,11 +67,12 @@ export class Floatie {
       return;
     }
 
-    // Fix: Build shadow DOM correctly — attach shadow FIRST, then inject style
-    // and container INTO the shadow root. Previously, content was appended to
-    // the light DOM before attachShadow() was called, which caused CSS isolation
-    // to break on sites with aggressive global resets (e.g. x.com, YouTube).
+    // Build shadow DOM correctly: attachShadow() first, then inject content
+    // INTO the shadow root so CSS is fully isolated from the host page.
     const bft = document.createElement("better-previews-tooltip");
+    // Shadow host needs a high z-index on the light DOM side so it stacks
+    // above x.com's own fixed headers, modals, etc.
+    bft.style.cssText = "position:fixed;top:0;left:0;z-index:2147483647;pointer-events:none;";
     document.body.appendChild(bft);
     const shadow = bft.attachShadow({ mode: "open" });
 
@@ -82,6 +80,10 @@ export class Floatie {
     style.textContent = floatieCssTxt;
     shadow.appendChild(style);
     shadow.appendChild(this.container);
+
+    // Re-enable pointer events on the container itself (host is none so it
+    // doesn't block clicks on the page underneath).
+    this.container.style.pointerEvents = "auto";
 
     this.shadowHost = bft;
     this.shadowRoot = shadow;
@@ -104,7 +106,7 @@ export class Floatie {
 
   /*
    * Wire hover-preview listeners to a single anchor element.
-   * Safe to call multiple times on the same element — WeakSet prevents duplicates.
+   * Safe to call multiple times — WeakSet prevents duplicate listeners.
    */
   attachLinkPreview(a: HTMLAnchorElement): void {
     if (this.wiredAnchors.has(a)) {
@@ -115,8 +117,21 @@ export class Floatie {
       return;
     }
 
-    if (!a.innerText.trim()) {
-      // There is no text, we may be highlighting an image.
+    // FIX: x.com wraps link text in deep React <span> trees. On the first
+    // MutationObserver tick the element is in the DOM but layout hasn't run,
+    // so a.innerText is '' even though text is visible. Use textContent as a
+    // fallback (available immediately, no layout flush needed). If both are
+    // empty we still wire the listener — isGoodUrl is the real quality gate.
+    const hasText =
+      (a.innerText && a.innerText.trim().length > 0) ||
+      (a.textContent && a.textContent.trim().length > 0);
+
+    // Only skip if the element is a pure icon/image link with no text at all
+    // AND has an img/svg child — otherwise wire it.
+    const isPureImageLink =
+      !hasText && a.querySelector("img, svg") !== null;
+
+    if (isPureImageLink) {
       return;
     }
 
@@ -136,13 +151,15 @@ export class Floatie {
         const previewOnHover =
           (await Storage.get("preview-on-hover")) ?? false;
 
+        // getBoundingClientRect() returns viewport-relative coords — correct
+        // for position:fixed. Previously used with position:absolute which
+        // caused off-screen rendering on scrolled pages.
         this.showActions(a.getBoundingClientRect(), e, a.href, [
           this.previewButton,
         ]);
 
         if (previewOnHover) {
           const timeout = (await Storage.get("preview-on-hover-delay")) ?? 3;
-          // Slowly hide the preview button via opacity over a duration of timeout.
           this.container.classList.add("hide-" + timeout);
           autoPreviewTimeout = setTimeout(() => {
             this.container.className = "";
@@ -153,7 +170,13 @@ export class Floatie {
       }, 500);
     });
 
-    a.addEventListener("mouseout", () => {
+    a.addEventListener("mouseout", (e: MouseEvent) => {
+      // Don't hide if the mouse moved INTO the floatie container itself.
+      const relatedTarget = e.relatedTarget as Node | null;
+      if (relatedTarget && this.container.contains(relatedTarget)) {
+        return;
+      }
+
       if (showTimeout) {
         clearTimeout(showTimeout);
         showTimeout = null;
@@ -166,37 +189,44 @@ export class Floatie {
       }
       hideTimeout = setTimeout(() => {
         this.hideAll();
-      }, 2000);
+      }, 300);
+    });
+
+    // Also hide when mouse leaves the floatie back to non-link area.
+    this.container.addEventListener("mouseleave", () => {
+      hideTimeout = setTimeout(() => {
+        this.hideAll();
+      }, 300);
+    });
+
+    this.container.addEventListener("mouseenter", () => {
+      if (hideTimeout) {
+        clearTimeout(hideTimeout);
+        hideTimeout = null;
+      }
     });
   }
 
   /*
    * Wire all existing anchors and set up a MutationObserver to catch
    * dynamically injected links from SPAs like x.com, YouTube, etc.
-   *
-   * Previously this ran querySelectorAll("a") once at load time — any links
-   * injected by React/Vue/etc after that point were silently ignored, which
-   * is why hover previews never appeared on modern SPA websites.
    */
   setupLinkPreviews(): void {
-    // Wire anchors already present in the DOM.
     document.querySelectorAll<HTMLAnchorElement>("a").forEach((a) => {
       this.attachLinkPreview(a);
     });
 
-    // Watch for new nodes added by SPA navigation / infinite scroll.
+    // Watch for new <a> tags added by SPA navigation / infinite scroll.
     this.domObserver = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
         mutation.addedNodes.forEach((node) => {
           if (node.nodeType !== Node.ELEMENT_NODE) return;
           const el = node as Element;
 
-          // The added node itself might be an <a>.
           if (el.tagName === "A") {
             this.attachLinkPreview(el as HTMLAnchorElement);
           }
 
-          // Or it might be a container with <a> descendants.
           el.querySelectorAll<HTMLAnchorElement>("a").forEach((a) => {
             this.attachLinkPreview(a);
           });
@@ -211,18 +241,15 @@ export class Floatie {
   }
 
   stopListening(): void {
-    // Disconnect the MutationObserver to prevent memory leaks.
     if (this.domObserver) {
       this.domObserver.disconnect();
       this.domObserver = null;
     }
 
-    // Remove shadow host (which contains all floatie UI).
     if (this.shadowHost && document.body.contains(this.shadowHost)) {
       document.body.removeChild(this.shadowHost);
     }
 
-    // Properly null out all window/document listeners.
     document.onmouseup = null;
     document.onkeydown = null;
     window.onscroll = null;
@@ -231,15 +258,12 @@ export class Floatie {
   }
 
   deferredMaybeShow(e: MouseEvent): void {
-    // Allow a little time for cancellation.
     this.showTimeout = window.setTimeout(() => this.maybeShow(e), 100);
   }
 
   maybeShow(e: MouseEvent): void {
-    // Ensure button is hidden by default.
     this.hideAll();
 
-    // Filter out empty/irrelevant selections.
     if (typeof window.getSelection == "undefined") {
       return;
     }
@@ -248,7 +272,6 @@ export class Floatie {
       return;
     }
 
-    // Show appropriate buttons.
     const selectedText = selection.toString().trim();
     const range = selection.getRangeAt(0);
     const boundingRect = range.getBoundingClientRect();
@@ -273,10 +296,8 @@ export class Floatie {
         url = new URL(urlStr);
       } else {
         return null;
-        // TODO: When same domain preview is enabled, check if urlStr is a fragment.
       }
     } catch (e) {
-      // href is an invalid URL
       return null;
     }
     return url;
@@ -293,15 +314,11 @@ export class Floatie {
     }
 
     if (url.protocol !== "http:" && url.protocol !== "https:") {
-      // We don't want to preview other schemes like tel:
       return false;
     }
 
     if (url.hostname === window.location.hostname) {
-      // Don't preview URLs of the same origin by default.
-      // Users can enable same-origin previews via the 'allow-same-origin-previews' option.
-      // NOTE: This is intentionally kept synchronous. The async version (checking storage)
-      // is only needed for the initial setup — MutationObserver callbacks need sync checks.
+      // Same-origin links are skipped by default.
       return false;
     }
 
@@ -316,9 +333,6 @@ export class Floatie {
     e: MouseEvent | KeyboardEvent,
     selectedText: string,
   ): boolean {
-    // Lightweight synchronous URL check used in event callbacks.
-    // (isGoodUrl is sync, but we avoid the same-origin restriction here
-    // so that clicking a link on x.com to an external site still triggers preview.)
     const looksLikeUrl = (s: string) => {
       try {
         const u = new URL(s);
@@ -331,10 +345,7 @@ export class Floatie {
     const isGoodHyperlink = (e: MouseEvent | KeyboardEvent) => {
       var target: any = e.target;
       do {
-        if (
-          target.nodeName.toUpperCase() === "A" &&
-          target.href
-        ) {
+        if (target.nodeName.toUpperCase() === "A" && target.href) {
           return true;
         }
       } while ((target = target.parentElement));
@@ -351,10 +362,7 @@ export class Floatie {
     const isWrappedByLink = (e: MouseEvent | KeyboardEvent) => {
       var target: any = e.target;
       do {
-        if (
-          target.nodeName.toUpperCase() === "A" &&
-          target.href
-        ) {
+        if (target.nodeName.toUpperCase() === "A" && target.href) {
           return target.href as string;
         }
       } while ((target = target.parentElement));
@@ -431,14 +439,12 @@ export class Floatie {
     buttons.forEach((b) => {
       b.style.display = "inline-block";
       b.onclick = () => {
-        // Get the latest selection again at click.
         if (typeof window.getSelection != "undefined") {
           const selection = window.getSelection()!;
           if (!selection.isCollapsed) {
             text = selection.toString().trim();
           }
 
-          // Use href for previews.
           if (b.innerText == "Preview") {
             const href = this.getPreviewUrl(e, text);
             if (href) {
@@ -461,29 +467,16 @@ export class Floatie {
       { application: manifest.__package_name__, action: action, data: data },
       window.location.origin,
     );
-    // chrome.runtime.sendMessage won't work because content is executed in page context.
-    // broadcast.postMessage is not ideal because multiple tabs of same origin receive it.
   }
 
   // It should be a no-op to call this multiple times.
   showContainer(boundingRect: DOMRect): void {
-    // Make container visible.
     this.container.style.display = "block";
 
-    // Ensure it's not covered by other page UI.
-    const getMaxZIndex = () => {
-      return new Promise((resolve: (arg0: number) => void) => {
-        const z = Math.max(
-          ...Array.from(document.querySelectorAll("body *"), (el) =>
-            parseFloat(window.getComputedStyle(el).zIndex),
-          ).filter((zIndex) => !Number.isNaN(zIndex)),
-          0,
-        );
-        resolve(z);
-      });
-    };
-
-    // We cannot pass boundRect directly as the library treats it as an HTMLElement.
+    // FIX: Use strategy:'fixed' so x/y from computePosition are
+    // viewport-relative, matching position:fixed on the container.
+    // Previously 'absolute' with no positioned ancestor in the shadow DOM
+    // caused the floatie to render at wrong coordinates (often off-screen).
     const virtualEl = {
       getBoundingClientRect() {
         return {
@@ -499,57 +492,43 @@ export class Floatie {
       },
     };
 
-    // Position over reference element.
     computePosition(virtualEl, this.container, {
       placement: "top",
-      strategy: "absolute", // If you use "fixed", x, y would change to clientX/Y.
+      strategy: "fixed",
       middleware: [
-        offset(12), // Space between mouse and tooltip.
+        offset(12),
         flip(),
-        shift({ padding: 5 }), // Space from the edge of the browser.
+        shift({ padding: 5 }),
         arrow({ element: this.tooltipArrow }),
       ],
     }).then(({ x, y, placement, middlewareData }) => {
-      /*
-       * screenX/Y - relative to physical screen.
-       * clientX/Y - relative to browser viewport. Use with position:fixed.
-       * pageX/Y - relative to page. Use this with position:absolute.
-       */
       Object.assign(this.container.style, {
         top: `${y}px`,
         left: `${x}px`,
       });
 
-      // Handle arrow placement.
       const coords = middlewareData.arrow;
-
       let staticSide = "bottom";
       switch (placement.split("-")[0]) {
-        case "top":
-          staticSide = "bottom";
-          break;
-        case "left":
-          staticSide = "right";
-          break;
-        case "bottom":
-          staticSide = "top";
-          break;
-        case "right":
-          staticSide = "left";
-          break;
+        case "top":    staticSide = "bottom"; break;
+        case "left":   staticSide = "right";  break;
+        case "bottom": staticSide = "top";    break;
+        case "right":  staticSide = "left";   break;
       }
       Object.assign(this.tooltipArrow.style, {
-        left: coords?.x != null ? `${coords.x}px` : "",
-        top: coords?.y != null ? `${coords.y}px` : "",
-        right: "",
+        left:   coords?.x != null ? `${coords.x}px` : "",
+        top:    coords?.y != null ? `${coords.y}px` : "",
+        right:  "",
         bottom: "",
-        [staticSide]: "-4px", // If you update this, update height and width of arrow.
+        [staticSide]: "-4px",
       });
 
-      getMaxZIndex().then((maxZ: number) => {
-        this.container.style.zIndex = "" + (maxZ + 10);
-        this.tooltipArrow.style.zIndex = "" + (maxZ - 1);
-      });
+      // FIX: getMaxZIndex() queries 'body *' which can't pierce shadow DOM.
+      // On x.com many elements have z-index > 9000. Instead of computing a
+      // dynamic max, just use the maximum possible CSS z-index value.
+      // The shadow host already has z-index:2147483647 on the light-DOM side.
+      this.container.style.zIndex = "2147483647";
+      this.tooltipArrow.style.zIndex = "2147483646";
     });
   }
 
