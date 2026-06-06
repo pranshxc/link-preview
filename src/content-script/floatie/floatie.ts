@@ -2,9 +2,6 @@ import floatieCssTxt from "./floatie.txt.css";
 import { Logger } from "../../utils/logger";
 import Storage from "../../utils/storage";
 import manifest from "../../manifest.json";
-// NOTE: We no longer use @floating-ui/dom for the hover-link floatie because
-// computePosition() cannot correctly measure elements inside a Shadow DOM.
-// We use direct coordinate math instead (see showAtRect).
 import { arrow, computePosition, flip, offset, shift } from "@floating-ui/dom";
 
 export class Floatie {
@@ -20,8 +17,13 @@ export class Floatie {
   logger = new Logger(this);
   private wiredAnchors = new WeakSet<HTMLAnchorElement>();
   private domObserver: MutationObserver | null = null;
-  // Track the current hide timer so mouseover-to-floatie doesn't dismiss it.
   private hideTimer: any = null;
+
+  // ── Alt/Option instant-preview state ──────────────────────────────────
+  private altKeyHeld = false;
+  private altBadge: HTMLElement | null = null;
+  private altMoveHandler: ((e: MouseEvent) => void) | null = null;
+  // ──────────────────────────────────────────────────────────────────────
 
   constructor() {
     const markup = `
@@ -35,29 +37,28 @@ export class Floatie {
     const tmp = document.createElement("div");
     tmp.innerHTML = markup;
 
-    const container    = tmp.querySelector<HTMLElement>("#sp-floatie-container")!;
-    const searchButton = tmp.querySelector<HTMLElement>("#sp-floatie-search")!;
-    const previewButton= tmp.querySelector<HTMLElement>("#sp-floatie-preview")!;
-    const copyButton   = tmp.querySelector<HTMLElement>("#sp-floatie-copy")!;
-    const tooltipArrow = tmp.querySelector<HTMLElement>("#sp-floatie-arrow")!;
+    const container     = tmp.querySelector<HTMLElement>("#sp-floatie-container")!;
+    const searchButton  = tmp.querySelector<HTMLElement>("#sp-floatie-search")!;
+    const previewButton = tmp.querySelector<HTMLElement>("#sp-floatie-preview")!;
+    const copyButton    = tmp.querySelector<HTMLElement>("#sp-floatie-copy")!;
+    const tooltipArrow  = tmp.querySelector<HTMLElement>("#sp-floatie-arrow")!;
 
     if (!container || !searchButton || !previewButton || !copyButton || !tooltipArrow) {
       throw new Error("Impossible error obtaining action buttons from DOM");
     }
 
-    this.container    = container;
-    this.searchButton = searchButton;
-    this.previewButton= previewButton;
-    this.copyButton   = copyButton;
-    this.tooltipArrow = tooltipArrow;
+    this.container     = container;
+    this.searchButton  = searchButton;
+    this.previewButton = previewButton;
+    this.copyButton    = copyButton;
+    this.tooltipArrow  = tooltipArrow;
     this.logger.debug("Initialized floatie");
   }
 
   startListening(): void {
     if (this.inIframe()) return;
 
-    // Create shadow host in light DOM — this is what we position.
-    // The shadow root just isolates CSS; all positioning is done on the HOST.
+    // Shadow host lives in light DOM — this is what we position via fixed coords.
     const bft = document.createElement("better-previews-tooltip");
     bft.style.cssText = [
       "all: initial",
@@ -65,108 +66,167 @@ export class Floatie {
       "top: 0",
       "left: 0",
       "z-index: 2147483647",
-      "pointer-events: none",   // host is transparent to clicks
+      "pointer-events: none",
       "display: block",
     ].join(";");
     document.body.appendChild(bft);
 
     const shadow = bft.attachShadow({ mode: "open" });
-    const style = document.createElement("style");
+    const style  = document.createElement("style");
     style.textContent = floatieCssTxt;
     shadow.appendChild(style);
     shadow.appendChild(this.container);
 
-    // Re-enable pointer events on the actual floatie UI inside the shadow.
     this.container.style.pointerEvents = "auto";
-    // Keep container hidden by default; we'll show it via showAtRect.
-    this.container.style.display = "none";
+    this.container.style.display       = "none";
 
-    // Keep container visible while mouse is over it.
     this.container.addEventListener("mouseenter", () => {
       if (this.hideTimer) { clearTimeout(this.hideTimer); this.hideTimer = null; }
     });
-    this.container.addEventListener("mouseleave", () => {
-      this.scheduleHide(300);
-    });
+    this.container.addEventListener("mouseleave", () => { this.scheduleHide(300); });
 
     this.shadowHost = bft;
     this.shadowRoot = shadow;
 
-    window.onscroll       = () => this.hideAll();
-    window.onresize       = () => this.hideAll();
-    window.oncontextmenu  = () => this.hideAll();
-    document.onmouseup    = (e) => this.deferredMaybeShow(e);
-    document.onkeydown    = () => this.hideAll();
+    // ── Create the Alt-mode badge (separate fixed element, no shadow DOM) ─
+    const badge = document.createElement("div");
+    badge.id = "sp-alt-badge";
+    badge.textContent = "⌥ Alt · instant preview";
+    badge.style.cssText = [
+      "all: initial",
+      "position: fixed",
+      "z-index: 2147483646",
+      "background: #1a1a2e",
+      "color: #a78bfa",
+      "font: 600 11px/1 sans-serif",
+      "padding: 4px 8px",
+      "border-radius: 4px",
+      "border: 1px solid #6d28d9",
+      "pointer-events: none",
+      "display: none",
+      "white-space: nowrap",
+      "letter-spacing: 0.02em",
+    ].join(";");
+    document.body.appendChild(badge);
+    this.altBadge = badge;
+    // ──────────────────────────────────────────────────────────────────────
+
+    window.onscroll      = () => this.hideAll();
+    window.onresize      = () => this.hideAll();
+    window.oncontextmenu = () => this.hideAll();
+    document.onmouseup   = (e) => this.deferredMaybeShow(e);
+
+    // keydown: use addEventListener (not onkeydown) so we don't clash with
+    // the text-selection hideAll that was previously on onkeydown.
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Alt" || e.key === "Option") {
+        e.preventDefault(); // stop browser menu-bar focus on Alt
+        this.enterAltMode();
+      } else {
+        // Any non-Alt key dismisses floatie (original behaviour).
+        this.hideAll();
+      }
+    });
+
+    window.addEventListener("keyup", (e) => {
+      if (e.key === "Alt" || e.key === "Option") {
+        this.exitAltMode();
+      }
+    });
+
+    // If window loses focus while Alt is held (e.g. user Cmd+Tabs), exit alt mode.
+    window.addEventListener("blur", () => this.exitAltMode());
 
     this.setupLinkPreviews();
   }
 
-  // -----------------------------------------------------------------------
-  // Position the floatie above (or below) a bounding rect.
-  // We move the SHADOW HOST to the right place in the light DOM, then the
-  // container inside renders at the right spot. This sidesteps the
-  // @floating-ui shadow-DOM measurement bug entirely.
-  // -----------------------------------------------------------------------
+  // ── Alt-mode helpers ────────────────────────────────────────────────────
+
+  private enterAltMode(): void {
+    if (this.altKeyHeld) return;
+    this.altKeyHeld = true;
+    this.hideAll();
+
+    if (this.altBadge) this.altBadge.style.display = "block";
+
+    // Follow cursor so the badge stays near the mouse.
+    this.altMoveHandler = (e: MouseEvent) => {
+      if (!this.altBadge) return;
+      const x = Math.min(e.clientX + 14, window.innerWidth  - 160);
+      const y = Math.max(e.clientY - 28, 4);
+      this.altBadge.style.left = x + "px";
+      this.altBadge.style.top  = y + "px";
+    };
+    document.addEventListener("mousemove", this.altMoveHandler);
+  }
+
+  private exitAltMode(): void {
+    if (!this.altKeyHeld) return;
+    this.altKeyHeld = false;
+    if (this.altBadge) this.altBadge.style.display = "none";
+    if (this.altMoveHandler) {
+      document.removeEventListener("mousemove", this.altMoveHandler);
+      this.altMoveHandler = null;
+    }
+  }
+
+  // ── Shadow-host coordinate positioning ─────────────────────────────────
+
   showAtRect(rect: DOMRect): void {
     if (!this.shadowHost) return;
 
-    const ARROW_SIZE  = 8;
-    const GAP         = 6;
-    const containerW  = this.container.offsetWidth  || 80;
-    const containerH  = this.container.offsetHeight || 30;
+    const ARROW_SIZE = 8;
+    const GAP        = 6;
+    const containerW = this.container.offsetWidth  || 80;
+    const containerH = this.container.offsetHeight || 30;
+    const vpW        = window.innerWidth;
 
-    const vpW = window.innerWidth;
-    const vpH = window.innerHeight;
-
-    // Try to place above the link; if not enough room, go below.
     let top: number;
     if (rect.top - containerH - ARROW_SIZE - GAP >= 0) {
       top = rect.top - containerH - ARROW_SIZE - GAP;
-      this.tooltipArrow.style.bottom  = "-4px";
-      this.tooltipArrow.style.top     = "";
+      this.tooltipArrow.style.bottom = "-4px";
+      this.tooltipArrow.style.top    = "";
     } else {
       top = rect.bottom + ARROW_SIZE + GAP;
-      this.tooltipArrow.style.top     = "-4px";
-      this.tooltipArrow.style.bottom  = "";
+      this.tooltipArrow.style.top    = "-4px";
+      this.tooltipArrow.style.bottom = "";
     }
 
-    // Horizontally center over the link, clamped to viewport edges.
     let left = rect.left + rect.width / 2 - containerW / 2;
     left = Math.max(5, Math.min(left, vpW - containerW - 5));
 
-    // Arrow horizontal center.
     const arrowLeft = (rect.left + rect.width / 2) - left - ARROW_SIZE / 2;
     this.tooltipArrow.style.left = Math.max(4, Math.min(arrowLeft, containerW - ARROW_SIZE - 4)) + "px";
 
-    // Move the shadow HOST to the computed position.
-    Object.assign(this.shadowHost.style, {
-      top:  top  + "px",
-      left: left + "px",
-    });
+    Object.assign(this.shadowHost.style, { top: top + "px", left: left + "px" });
   }
+
+  // ── Per-anchor event wiring ─────────────────────────────────────────────
 
   attachLinkPreview(a: HTMLAnchorElement): void {
     if (this.wiredAnchors.has(a)) return;
     if (!this.isGoodUrl(a.href)) return;
 
-    // Only skip pure icon-links (no text AND has img/svg child).
-    const hasText = !!(a.innerText?.trim() || a.textContent?.trim());
-    const isPureImageLink = !hasText && !!a.querySelector("img, svg");
-    if (isPureImageLink) return;
+    const hasText        = !!(a.innerText?.trim() || a.textContent?.trim());
+    const isPureImgLink  = !hasText && !!a.querySelector("img, svg");
+    if (isPureImgLink) return;
 
     this.wiredAnchors.add(a);
 
-    let showTimeout: any = null;
+    let showTimeout: any     = null;
     let autoPreviewTimeout: any = null;
 
-    a.addEventListener("mouseover", (e) => {
-      // Cancel any pending hide.
+    a.addEventListener("mouseover", (e: MouseEvent) => {
+      // ── ALT MODE: instant preview, no floatie ──
+      if (this.altKeyHeld) {
+        this.sendMessage("preview", a.href);
+        return;
+      }
+
       if (this.hideTimer) { clearTimeout(this.hideTimer); this.hideTimer = null; }
 
       showTimeout = setTimeout(async () => {
         const previewOnHover = (await Storage.get("preview-on-hover")) ?? false;
-
-        // Show only the Preview button for link hovers.
         this.showLinkActions(a, [this.previewButton]);
 
         if (previewOnHover) {
@@ -175,7 +235,6 @@ export class Floatie {
           autoPreviewTimeout = setTimeout(() => {
             this.container.className = "";
             this.hideAll();
-            // Directly send the preview action — no floatie click needed.
             this.sendMessage("preview", a.href);
           }, delaySec * 1000);
         }
@@ -183,7 +242,6 @@ export class Floatie {
     });
 
     a.addEventListener("mouseout", (e: MouseEvent) => {
-      // Don't hide if mouse moved into the floatie itself.
       const rel = e.relatedTarget as Node | null;
       if (rel && this.shadowHost && this.shadowHost.contains(rel)) return;
 
@@ -197,26 +255,20 @@ export class Floatie {
     });
   }
 
-  // Show floatie buttons for a link hover. Wires onclick handlers.
   showLinkActions(a: HTMLAnchorElement, buttons: HTMLElement[]): void {
     this.hideAll();
     if (!buttons.length) return;
 
-    // Make buttons visible first so we can measure containerH for positioning.
     buttons.forEach((b) => {
       b.style.display = "inline-block";
       b.onclick = () => {
-        this.sendMessage(b.getAttribute("data-action") || "unknown-action", a.href);
+        this.sendMessage(b.getAttribute("data-action") || "preview", a.href);
         this.hideAll();
       };
     });
 
     this.container.style.display = "block";
-
-    // Use rAF so the browser has laid out the container and offsetHeight is correct.
-    requestAnimationFrame(() => {
-      this.showAtRect(a.getBoundingClientRect());
-    });
+    requestAnimationFrame(() => { this.showAtRect(a.getBoundingClientRect()); });
   }
 
   setupLinkPreviews(): void {
@@ -243,21 +295,21 @@ export class Floatie {
   stopListening(): void {
     this.domObserver?.disconnect();
     this.domObserver = null;
+    this.exitAltMode();
+    if (this.altBadge && document.body.contains(this.altBadge)) {
+      document.body.removeChild(this.altBadge);
+    }
     if (this.shadowHost && document.body.contains(this.shadowHost)) {
       document.body.removeChild(this.shadowHost);
     }
-    document.onmouseup   = null;
-    document.onkeydown   = null;
-    window.onscroll      = null;
-    window.onresize      = null;
-    window.oncontextmenu = null;
+    document.onmouseup  = null;
+    window.onscroll     = null;
+    window.onresize     = null;
+    window.oncontextmenu= null;
   }
 
-  // -----------------------------------------------------------------------
-  // Text-selection floatie (search / copy / preview of selected URL).
-  // This still uses computePosition because the reference is a Range rect
-  // from the light DOM — not a shadow element — so floating-ui works fine.
-  // -----------------------------------------------------------------------
+  // ── Text-selection floatie ──────────────────────────────────────────────
+
   deferredMaybeShow(e: MouseEvent): void {
     this.showTimeout = window.setTimeout(() => this.maybeShow(e), 100);
   }
@@ -271,7 +323,6 @@ export class Floatie {
     const selectedText = selection.toString().trim();
     const range        = selection.getRangeAt(0);
     const boundingRect = range.getBoundingClientRect();
-    this.logger.debug("Selected: ", selectedText);
 
     const actionsToShow: HTMLElement[] = [];
     if (this.shouldShowPreview(e, selectedText))     actionsToShow.push(this.previewButton);
@@ -281,13 +332,10 @@ export class Floatie {
     this.showActions(boundingRect, e, selectedText, actionsToShow);
   }
 
-  // -----------------------------------------------------------------------
-  // Helpers
-  // -----------------------------------------------------------------------
+  // ── Helpers ─────────────────────────────────────────────────────────────
+
   getAbsoluteUrl(urlStr: string): URL | null {
-    try {
-      if (/^(?:[a-z+]+:)?\//i.test(urlStr)) return new URL(urlStr);
-    } catch {}
+    try { if (/^(?:[a-z+]+:)?\//i.test(urlStr)) return new URL(urlStr); } catch {}
     return null;
   }
 
@@ -306,8 +354,7 @@ export class Floatie {
 
   shouldShowPreview(e: MouseEvent | KeyboardEvent, selectedText: string): boolean {
     const looksLikeUrl = (s: string) => {
-      try { const u = new URL(s); return u.protocol === "http:" || u.protocol === "https:"; }
-      catch { return false; }
+      try { const u = new URL(s); return u.protocol === "http:" || u.protocol === "https:"; } catch { return false; }
     };
     const isGoodHyperlink = (ev: MouseEvent | KeyboardEvent) => {
       let t: any = ev.target;
@@ -325,15 +372,15 @@ export class Floatie {
   }
 
   shouldShowSearch(e: MouseEvent, selectedText: string): boolean {
-    const isQuerySize  = (s: string) => s.length > 0 && s.length < 100;
-    const isEmail      = (s: string) => /^[^@]+@[^@]+\.[^@]+$/.test(s.toLowerCase());
-    const isDate       = (s: string) => !isNaN(Date.parse(s));
-    const hasLetters   = (s: string) => /[a-zA-Z]/.test(s);
-    return isQuerySize(selectedText) && hasLetters(selectedText) && !isEmail(selectedText)
-      && !isDate(selectedText) && !this.shouldShowPreview(e, selectedText);
+    const isQuerySize = (s: string) => s.length > 0 && s.length < 100;
+    const isEmail     = (s: string) => /^[^@]+@[^@]+\.[^@]+$/.test(s.toLowerCase());
+    const isDate      = (s: string) => !isNaN(Date.parse(s));
+    const hasLetters  = (s: string) => /[a-zA-Z]/.test(s);
+    return isQuerySize(selectedText) && hasLetters(selectedText)
+      && !isEmail(selectedText) && !isDate(selectedText)
+      && !this.shouldShowPreview(e, selectedText);
   }
 
-  // Text-selection floatie using floating-ui (safe here: reference is a Range, not shadow element).
   showActions(boundingRect: DOMRect, e: MouseEvent, text: string, buttons: HTMLElement[]): void {
     this.hideAll();
     if (!buttons.length) return;
@@ -351,40 +398,23 @@ export class Floatie {
             if (href) sendText = href;
           }
         }
-        this.sendMessage(b.getAttribute("data-action") || "unknown-action", sendText);
+        this.sendMessage(b.getAttribute("data-action") || "preview", sendText);
         this.hideAll();
       };
     });
 
-    const virtualEl = { getBoundingClientRect: () => ({
-      width: boundingRect.width, height: boundingRect.height,
-      x: boundingRect.x, y: boundingRect.y,
-      top: boundingRect.top, left: boundingRect.left,
-      right: boundingRect.right, bottom: boundingRect.bottom,
-    }) };
+    const virtualEl = { getBoundingClientRect: () => ({ ...boundingRect }) };
 
-    // For the selection floatie we must position the container relative to
-    // the shadow host. Move the host to 0,0 first so container coords align.
-    if (this.shadowHost) {
-      this.shadowHost.style.top  = "0px";
-      this.shadowHost.style.left = "0px";
-    }
+    if (this.shadowHost) { this.shadowHost.style.top = "0px"; this.shadowHost.style.left = "0px"; }
 
     computePosition(virtualEl, this.container, {
       placement: "top",
-      strategy: "fixed",
-      middleware: [
-        offset(12), flip(), shift({ padding: 5 }),
-        arrow({ element: this.tooltipArrow }),
-      ],
+      strategy:  "fixed",
+      middleware: [offset(12), flip(), shift({ padding: 5 }), arrow({ element: this.tooltipArrow })],
     }).then(({ x, y, placement, middlewareData }) => {
-      if (this.shadowHost) {
-        this.shadowHost.style.top  = y + "px";
-        this.shadowHost.style.left = x + "px";
-      }
-
-      const coords = middlewareData.arrow;
-      const staticSide = { top: "bottom", left: "right", bottom: "top", right: "left" }[placement.split("-")[0]] ?? "bottom";
+      if (this.shadowHost) { this.shadowHost.style.top = y + "px"; this.shadowHost.style.left = x + "px"; }
+      const coords     = middlewareData.arrow;
+      const staticSide = ({ top: "bottom", left: "right", bottom: "top", right: "left" } as any)[placement.split("-")[0]] ?? "bottom";
       Object.assign(this.tooltipArrow.style, {
         left: coords?.x != null ? coords.x + "px" : "",
         top:  coords?.y != null ? coords.y + "px" : "",
@@ -405,7 +435,7 @@ export class Floatie {
   hideAll(): void {
     clearTimeout(this.showTimeout);
     if (this.hideTimer) { clearTimeout(this.hideTimer); this.hideTimer = null; }
-    this.container.style.display   = "none";
+    this.container.style.display    = "none";
     this.copyButton.style.display   = "none";
     this.searchButton.style.display = "none";
     this.previewButton.style.display= "none";
