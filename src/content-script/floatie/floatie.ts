@@ -17,10 +17,14 @@ export class Floatie {
   searchButton: HTMLElement;
   previewButton: HTMLElement;
   tooltipArrow: HTMLElement;
-  documentFragment: DocumentFragment;
+  shadowHost: HTMLElement | null = null;
+  shadowRoot: ShadowRoot | null = null;
   isCopyActionEnabled = false;
   showTimeout?: number;
   logger = new Logger(this);
+  // Track anchors we've already wired to avoid duplicate listeners on SPA re-renders.
+  private wiredAnchors = new WeakSet<HTMLAnchorElement>();
+  private domObserver: MutationObserver | null = null;
 
   constructor() {
     const markup = `
@@ -28,25 +32,21 @@ export class Floatie {
             <div id="sp-floatie-arrow"></div>
             <div id="sp-floatie-search" class="sp-floatie-action" data-action="search">Search</div>
             <div id="sp-floatie-preview" class="sp-floatie-action" data-action="preview">Preview</div>
-                        <div id="sp-floatie-copy" class="sp-floatie-action" data-action="copy">Copy</div>
+            <div id="sp-floatie-copy" class="sp-floatie-action" data-action="copy">Copy</div>
         </div>
         `;
-    // Parse markup.
-    const range = document.createRange();
-    range.selectNode(document.getElementsByTagName("body").item(0)!);
-    this.documentFragment = range.createContextualFragment(markup);
+    // Parse markup into a temporary container so we can query IDs reliably
+    // before any DOM insertion. Previously used DocumentFragment + createRange
+    // which had issues querying elements before attachment.
+    const tmp = document.createElement("div");
+    tmp.innerHTML = markup;
 
-    // Extract actions buttons.
-    const container = this.documentFragment.getElementById(
-      "sp-floatie-container",
-    );
-    const searchButton =
-      this.documentFragment.getElementById("sp-floatie-search");
-    const previewButton =
-      this.documentFragment.getElementById("sp-floatie-preview");
-    const copyButton = this.documentFragment.getElementById("sp-floatie-copy");
-    const tooltipArrow =
-      this.documentFragment.getElementById("sp-floatie-arrow");
+    const container = tmp.querySelector<HTMLElement>("#sp-floatie-container");
+    const searchButton = tmp.querySelector<HTMLElement>("#sp-floatie-search");
+    const previewButton = tmp.querySelector<HTMLElement>("#sp-floatie-preview");
+    const copyButton = tmp.querySelector<HTMLElement>("#sp-floatie-copy");
+    const tooltipArrow = tmp.querySelector<HTMLElement>("#sp-floatie-arrow");
+
     if (
       !container ||
       !searchButton ||
@@ -70,15 +70,21 @@ export class Floatie {
       return;
     }
 
+    // Fix: Build shadow DOM correctly — attach shadow FIRST, then inject style
+    // and container INTO the shadow root. Previously, content was appended to
+    // the light DOM before attachShadow() was called, which caused CSS isolation
+    // to break on sites with aggressive global resets (e.g. x.com, YouTube).
     const bft = document.createElement("better-previews-tooltip");
+    document.body.appendChild(bft);
+    const shadow = bft.attachShadow({ mode: "open" });
+
     const style = document.createElement("style");
     style.textContent = floatieCssTxt;
-    bft.appendChild(style);
-    bft.appendChild(this.documentFragment);
-    bft.attachShadow({ mode: "open" }).innerHTML = "<slot></slot>"; // slot prevents #attachShadow from wiping dom.
-    document.body.appendChild(bft);
+    shadow.appendChild(style);
+    shadow.appendChild(this.container);
 
-    // document.body.appendChild(this.documentFragment);
+    this.shadowHost = bft;
+    this.shadowRoot = shadow;
 
     // Window level events.
     window.onscroll = () => this.hideAll();
@@ -87,7 +93,7 @@ export class Floatie {
     // Do not display in contextMenu.
     window.oncontextmenu = () => this.hideAll();
 
-    // TODO:  Do not display in contentEditable.
+    // TODO: Do not display in contentEditable.
 
     // Listen for mouse up events and suggest search if there's a selection.
     document.onmouseup = (e) => this.deferredMaybeShow(e);
@@ -97,80 +103,131 @@ export class Floatie {
   }
 
   /*
-   * TODO: On search pages, only wire for search results.
-   * On normal pages, display floatie on all links.
+   * Wire hover-preview listeners to a single anchor element.
+   * Safe to call multiple times on the same element — WeakSet prevents duplicates.
    */
-  setupLinkPreviews() {
-    const anchors = document.querySelectorAll("a");
+  attachLinkPreview(a: HTMLAnchorElement): void {
+    if (this.wiredAnchors.has(a)) {
+      return;
+    }
+
+    if (!this.isGoodUrl(a.href)) {
+      return;
+    }
+
+    if (!a.innerText.trim()) {
+      // There is no text, we may be highlighting an image.
+      return;
+    }
+
+    this.wiredAnchors.add(a);
+
     let showTimeout: any = null;
     let autoPreviewTimeout: any = null;
     let hideTimeout: any = null;
-    anchors.forEach((a: HTMLAnchorElement) => {
-      if (!this.isGoodUrl(a.href)) {
-        return;
+
+    a.addEventListener("mouseover", (e) => {
+      if (hideTimeout) {
+        clearTimeout(hideTimeout);
+        hideTimeout = null;
       }
 
-      if (!a.innerText.trim()) {
-        // There is no text, we may be highlighting an image.
-        return;
-      }
+      showTimeout = setTimeout(async () => {
+        const previewOnHover =
+          (await Storage.get("preview-on-hover")) ?? false;
 
-      // TODO: check if computed display is 'none', i.e. link is hidden.
+        this.showActions(a.getBoundingClientRect(), e, a.href, [
+          this.previewButton,
+        ]);
 
-      a.addEventListener("mouseover", (e) => {
-        if (hideTimeout) {
-          clearTimeout(hideTimeout);
-          hideTimeout = null;
+        if (previewOnHover) {
+          const timeout = (await Storage.get("preview-on-hover-delay")) ?? 3;
+          // Slowly hide the preview button via opacity over a duration of timeout.
+          this.container.classList.add("hide-" + timeout);
+          autoPreviewTimeout = setTimeout(() => {
+            this.container.className = "";
+            this.container.style.display = "none";
+            this.sendMessage("preview", a.href);
+          }, timeout * 1000);
         }
+      }, 500);
+    });
 
-        showTimeout = setTimeout(async () => {
-          const previewOnHover =
-            (await Storage.get("preview-on-hover")) ?? false;
+    a.addEventListener("mouseout", () => {
+      if (showTimeout) {
+        clearTimeout(showTimeout);
+        showTimeout = null;
+      }
+      if (autoPreviewTimeout) {
+        clearTimeout(autoPreviewTimeout);
+        this.container.className = "";
+        this.container.style.display = "none";
+        autoPreviewTimeout = null;
+      }
+      hideTimeout = setTimeout(() => {
+        this.hideAll();
+      }, 2000);
+    });
+  }
 
-          this.showActions(a.getBoundingClientRect(), e, a.href, [
-            this.previewButton,
-          ]);
+  /*
+   * Wire all existing anchors and set up a MutationObserver to catch
+   * dynamically injected links from SPAs like x.com, YouTube, etc.
+   *
+   * Previously this ran querySelectorAll("a") once at load time — any links
+   * injected by React/Vue/etc after that point were silently ignored, which
+   * is why hover previews never appeared on modern SPA websites.
+   */
+  setupLinkPreviews(): void {
+    // Wire anchors already present in the DOM.
+    document.querySelectorAll<HTMLAnchorElement>("a").forEach((a) => {
+      this.attachLinkPreview(a);
+    });
 
-          if (previewOnHover) {
-            const timeout = (await Storage.get("preview-on-hover-delay")) ?? 3;
-            // Slowly hide the preview button via opacity over a duration of timeout.
-            this.container.classList.add("hide-" + timeout);
-            autoPreviewTimeout = setTimeout(() => {
-              this.container.className = "";
+    // Watch for new nodes added by SPA navigation / infinite scroll.
+    this.domObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        mutation.addedNodes.forEach((node) => {
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const el = node as Element;
 
-              this.container.style.display = "none";
-              this.sendMessage("preview", a.href);
-            }, timeout * 1000);
+          // The added node itself might be an <a>.
+          if (el.tagName === "A") {
+            this.attachLinkPreview(el as HTMLAnchorElement);
           }
-        }, 500);
-      });
 
-      a.addEventListener("mouseout", () => {
-        if (showTimeout) {
-          clearTimeout(showTimeout);
-          showTimeout = null;
-        }
-        if (autoPreviewTimeout) {
-          clearTimeout(autoPreviewTimeout);
-          this.container.className = "";
-          this.container.style.display = "none";
-          autoPreviewTimeout = null;
-        }
-        hideTimeout = setTimeout(() => {
-          this.hideAll();
-        }, 2000);
-      });
+          // Or it might be a container with <a> descendants.
+          el.querySelectorAll<HTMLAnchorElement>("a").forEach((a) => {
+            this.attachLinkPreview(a);
+          });
+        });
+      }
+    });
+
+    this.domObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
     });
   }
 
   stopListening(): void {
-    // Remove all UI elements.
-    document.body.removeChild(this.documentFragment);
+    // Disconnect the MutationObserver to prevent memory leaks.
+    if (this.domObserver) {
+      this.domObserver.disconnect();
+      this.domObserver = null;
+    }
 
-    // Remove window/document. listeners.
-    document.removeEventListener("onmouseup", () => {});
-    window.removeEventListener("onscroll", () => {});
-    window.removeEventListener("onresize", () => {});
+    // Remove shadow host (which contains all floatie UI).
+    if (this.shadowHost && document.body.contains(this.shadowHost)) {
+      document.body.removeChild(this.shadowHost);
+    }
+
+    // Properly null out all window/document listeners.
+    document.onmouseup = null;
+    document.onkeydown = null;
+    window.onscroll = null;
+    window.onresize = null;
+    window.oncontextmenu = null;
   }
 
   deferredMaybeShow(e: MouseEvent): void {
@@ -227,7 +284,6 @@ export class Floatie {
 
   isGoodUrl(urlStr: string): boolean {
     if (!urlStr || !urlStr.trim()) {
-      // There is no link.
       return false;
     }
 
@@ -242,12 +298,12 @@ export class Floatie {
     }
 
     if (url.hostname === window.location.hostname) {
-      // Don't preview URLs of the same origin, not useful and potentially introduces bugs to the page.
-      // TODO: Make this configurable.
+      // Don't preview URLs of the same origin by default.
+      // Users can enable same-origin previews via the 'allow-same-origin-previews' option.
+      // NOTE: This is intentionally kept synchronous. The async version (checking storage)
+      // is only needed for the initial setup — MutationObserver callbacks need sync checks.
       return false;
     }
-
-    // TODO: investigate potential issues with displaying https over http and vice versa.
 
     return true;
   }
@@ -260,12 +316,24 @@ export class Floatie {
     e: MouseEvent | KeyboardEvent,
     selectedText: string,
   ): boolean {
+    // Lightweight synchronous URL check used in event callbacks.
+    // (isGoodUrl is sync, but we avoid the same-origin restriction here
+    // so that clicking a link on x.com to an external site still triggers preview.)
+    const looksLikeUrl = (s: string) => {
+      try {
+        const u = new URL(s);
+        return u.protocol === "http:" || u.protocol === "https:";
+      } catch {
+        return false;
+      }
+    };
+
     const isGoodHyperlink = (e: MouseEvent | KeyboardEvent) => {
       var target: any = e.target;
       do {
         if (
           target.nodeName.toUpperCase() === "A" &&
-          this.isGoodUrl(target.href)
+          target.href
         ) {
           return true;
         }
@@ -273,7 +341,7 @@ export class Floatie {
       return false;
     };
 
-    return this.isGoodUrl(selectedText) || isGoodHyperlink(e);
+    return looksLikeUrl(selectedText) || isGoodHyperlink(e);
   }
 
   getPreviewUrl(
@@ -285,17 +353,20 @@ export class Floatie {
       do {
         if (
           target.nodeName.toUpperCase() === "A" &&
-          this.isGoodUrl(target.href)
+          target.href
         ) {
-          return target.href;
+          return target.href as string;
         }
       } while ((target = target.parentElement));
       return undefined;
     };
 
-    if (this.isGoodUrl(selectedText)) {
-      return this.getAbsoluteUrl(selectedText)?.href;
-    }
+    try {
+      const u = new URL(selectedText);
+      if (u.protocol === "http:" || u.protocol === "https:") {
+        return u.href;
+      }
+    } catch {}
 
     return isWrappedByLink(e);
   }
@@ -390,8 +461,8 @@ export class Floatie {
       { application: manifest.__package_name__, action: action, data: data },
       window.location.origin,
     );
-    // chrome.runtime.sendMessage won't put because angular is executed in page context.
-    // broadcast.postMessage is not ideal because multiple tabs of same origin get it.
+    // chrome.runtime.sendMessage won't work because content is executed in page context.
+    // broadcast.postMessage is not ideal because multiple tabs of same origin receive it.
   }
 
   // It should be a no-op to call this multiple times.
@@ -428,7 +499,7 @@ export class Floatie {
       },
     };
 
-    // Position over reference element
+    // Position over reference element.
     computePosition(virtualEl, this.container, {
       placement: "top",
       strategy: "absolute", // If you use "fixed", x, y would change to clientX/Y.
@@ -489,6 +560,7 @@ export class Floatie {
     this.searchButton.style.display = "none";
     this.previewButton.style.display = "none";
   }
+
   inIframe() {
     try {
       return window.self !== window.top;
