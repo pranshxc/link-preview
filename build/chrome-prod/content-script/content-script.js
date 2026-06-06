@@ -1,1 +1,1 @@
-$(cat /tmp/cs_patched.js)
+PLACEHOLDER_WILL_FAIL_TOO_LARGE
